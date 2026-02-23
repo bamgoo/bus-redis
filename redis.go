@@ -1,0 +1,763 @@
+package bus_redis
+
+import (
+	"context"
+	"errors"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/bamgoo/bamgoo"
+	"github.com/bamgoo/bus"
+	"github.com/redis/go-redis/v9"
+)
+
+var (
+	errRedisInvalidConnection = errors.New("invalid redis connection")
+)
+
+const (
+	systemAnnounceTopic    = "announce"
+	systemReplyTopic       = "reply"
+	defaultAnnouncePeriod  = 10 * time.Second
+	defaultAnnounceTimeout = 30 * time.Second
+	defaultReplyTTL        = 30 * time.Second
+)
+
+type (
+	redisBusDriver struct{}
+
+	redisBusConnection struct {
+		mutex   sync.RWMutex
+		running bool
+
+		instance *bus.Instance
+		setting  redisBusSetting
+		client   *redis.Client
+
+		subjects map[string]struct{}
+		pubsubs  []*redis.PubSub
+
+		identity bamgoo.NodeInfo
+		cache    map[string]bamgoo.NodeInfo
+
+		announceInterval time.Duration
+		announceTTL      time.Duration
+		done             chan struct{}
+		wg               sync.WaitGroup
+
+		stats map[string]*statsEntry
+	}
+
+	redisBusSetting struct {
+		Addr     string
+		Username string
+		Password string
+		Database int
+		Prefix   string
+		Version  string
+
+		AnnounceInterval time.Duration
+		AnnounceTTL      time.Duration
+		ReplyTTL         time.Duration
+	}
+
+	statsEntry struct {
+		name         string
+		numRequests  int
+		numErrors    int
+		totalLatency int64
+	}
+
+	requestMessage struct {
+		ID    string `json:"id"`
+		Reply string `json:"reply"`
+		Data  []byte `json:"data"`
+	}
+
+	responseMessage struct {
+		Data  []byte `json:"data"`
+		Error string `json:"error,omitempty"`
+	}
+
+	announceMessage struct {
+		Project  string   `json:"project"`
+		Node     string   `json:"node"`
+		Role     string   `json:"role"`
+		Services []string `json:"services"`
+		Updated  int64    `json:"updated"`
+		Online   *bool    `json:"online,omitempty"`
+	}
+)
+
+func init() {
+	bamgoo.Register("redis", &redisBusDriver{})
+}
+
+func (d *redisBusDriver) Connect(inst *bus.Instance) (bus.Connection, error) {
+	setting := redisBusSetting{
+		Addr:     "127.0.0.1:6379",
+		Database: 0,
+		Prefix:   inst.Config.Prefix,
+		Version:  "1.0.0",
+	}
+
+	cfg := inst.Config.Setting
+	if v, ok := cfg["addr"].(string); ok && strings.TrimSpace(v) != "" {
+		setting.Addr = strings.TrimSpace(v)
+	}
+	if v, ok := cfg["server"].(string); ok && strings.TrimSpace(v) != "" {
+		setting.Addr = strings.TrimSpace(v)
+	}
+	if v, ok := cfg["host"].(string); ok && strings.TrimSpace(v) != "" {
+		port := "6379"
+		if p, ok := cfg["port"].(string); ok && strings.TrimSpace(p) != "" {
+			port = strings.TrimSpace(p)
+		}
+		setting.Addr = strings.TrimSpace(v) + ":" + port
+	}
+	if v, ok := cfg["username"].(string); ok {
+		setting.Username = v
+	}
+	if v, ok := cfg["password"].(string); ok {
+		setting.Password = v
+	}
+	if v, ok := cfg["version"].(string); ok && strings.TrimSpace(v) != "" {
+		setting.Version = strings.TrimSpace(v)
+	}
+	if n, ok := parseIntSetting(cfg["database"]); ok {
+		setting.Database = n
+	}
+
+	setting.AnnounceInterval = parseDurationSetting(cfg["announce"])
+	if setting.AnnounceInterval <= 0 {
+		setting.AnnounceInterval = defaultAnnouncePeriod
+	}
+	setting.AnnounceTTL = parseDurationSetting(cfg["announce_ttl"])
+	if setting.AnnounceTTL <= 0 {
+		setting.AnnounceTTL = defaultAnnounceTimeout
+	}
+	setting.ReplyTTL = parseDurationSetting(cfg["reply_ttl"])
+	if setting.ReplyTTL <= 0 {
+		setting.ReplyTTL = defaultReplyTTL
+	}
+
+	project := strings.TrimSpace(bamgoo.Project())
+	if project == "" {
+		project = bamgoo.BAMGOO
+	}
+	identity := bamgoo.Identity()
+	node := strings.TrimSpace(identity.Node)
+	if node == "" {
+		node = bamgoo.Generate("node")
+	}
+	role := strings.TrimSpace(identity.Role)
+	if role == "" {
+		role = bamgoo.BAMGOO
+	}
+
+	return &redisBusConnection{
+		instance: inst,
+		setting:  setting,
+		client: redis.NewClient(&redis.Options{
+			Addr:     setting.Addr,
+			Username: setting.Username,
+			Password: setting.Password,
+			DB:       setting.Database,
+		}),
+		subjects:         make(map[string]struct{}, 0),
+		pubsubs:          make([]*redis.PubSub, 0),
+		identity:         bamgoo.NodeInfo{Project: project, Node: node, Role: role},
+		cache:            make(map[string]bamgoo.NodeInfo, 0),
+		announceInterval: setting.AnnounceInterval,
+		announceTTL:      setting.AnnounceTTL,
+		done:             make(chan struct{}),
+		stats:            make(map[string]*statsEntry, 0),
+	}, nil
+}
+
+func (c *redisBusConnection) Register(subject string) error {
+	c.mutex.Lock()
+	c.subjects[subject] = struct{}{}
+	c.mutex.Unlock()
+	return nil
+}
+
+func (c *redisBusConnection) Open() error {
+	if c.client == nil {
+		return errRedisInvalidConnection
+	}
+	return c.client.Ping(context.Background()).Err()
+}
+
+func (c *redisBusConnection) Close() error {
+	if c.client == nil {
+		return nil
+	}
+	return c.client.Close()
+}
+
+func (c *redisBusConnection) Start() error {
+	c.mutex.Lock()
+	if c.running {
+		c.mutex.Unlock()
+		return nil
+	}
+	if c.client == nil {
+		c.mutex.Unlock()
+		return errRedisInvalidConnection
+	}
+
+	for base := range c.subjects {
+		callKey := "call." + base
+		queueKey := "queue." + base
+		eventKey := "event." + base
+
+		c.wg.Add(1)
+		go c.consumeCall(base, callKey)
+
+		c.wg.Add(1)
+		go c.consumeQueue(base, queueKey)
+
+		ps := c.client.Subscribe(context.Background(), eventKey)
+		c.pubsubs = append(c.pubsubs, ps)
+		c.wg.Add(1)
+		go c.consumeEvent(base, ps)
+	}
+
+	announceSub := c.client.Subscribe(context.Background(), c.announceSubject())
+	c.pubsubs = append(c.pubsubs, announceSub)
+	c.wg.Add(1)
+	go c.consumeAnnounce(announceSub)
+
+	c.running = true
+	c.mutex.Unlock()
+
+	c.publishAnnounce()
+
+	c.wg.Add(2)
+	go c.announceLoop()
+	go c.gcLoop()
+
+	return nil
+}
+
+func (c *redisBusConnection) Stop() error {
+	c.mutex.Lock()
+	if !c.running {
+		c.mutex.Unlock()
+		return nil
+	}
+	pubsubs := c.pubsubs
+	c.pubsubs = nil
+	done := c.done
+	c.done = make(chan struct{})
+	c.running = false
+	c.mutex.Unlock()
+
+	c.publishOffline()
+
+	close(done)
+	for _, ps := range pubsubs {
+		_ = ps.Close()
+	}
+	c.wg.Wait()
+
+	return nil
+}
+
+func (c *redisBusConnection) Request(subject string, data []byte, timeout time.Duration) ([]byte, error) {
+	if c.client == nil {
+		return nil, errRedisInvalidConnection
+	}
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+
+	replyKey := c.replyKey()
+	req := requestMessage{ID: bamgoo.Generate("req"), Reply: replyKey, Data: data}
+	body, err := bamgoo.Marshal(bamgoo.JSON, req)
+	if err != nil {
+		return nil, err
+	}
+	if err = c.client.LPush(context.Background(), subject, body).Err(); err != nil {
+		return nil, err
+	}
+
+	values, err := c.client.BRPop(context.Background(), timeout, replyKey).Result()
+	if err != nil {
+		return nil, err
+	}
+	if len(values) < 2 {
+		return nil, errors.New("invalid reply")
+	}
+	_ = c.client.Del(context.Background(), replyKey).Err()
+
+	res := responseMessage{}
+	if err := bamgoo.Unmarshal(bamgoo.JSON, []byte(values[1]), &res); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(res.Error) != "" {
+		return nil, errors.New(res.Error)
+	}
+	return res.Data, nil
+}
+
+func (c *redisBusConnection) Publish(subject string, data []byte) error {
+	if c.client == nil {
+		return errRedisInvalidConnection
+	}
+	return c.client.Publish(context.Background(), subject, data).Err()
+}
+
+func (c *redisBusConnection) Enqueue(subject string, data []byte) error {
+	if c.client == nil {
+		return errRedisInvalidConnection
+	}
+	return c.client.LPush(context.Background(), subject, data).Err()
+}
+
+func (c *redisBusConnection) Stats() []bamgoo.ServiceStats {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	all := make([]bamgoo.ServiceStats, 0, len(c.stats))
+	for _, st := range c.stats {
+		avg := int64(0)
+		if st.numRequests > 0 {
+			avg = st.totalLatency / int64(st.numRequests)
+		}
+		all = append(all, bamgoo.ServiceStats{
+			Name:         st.name,
+			Version:      c.setting.Version,
+			NumRequests:  st.numRequests,
+			NumErrors:    st.numErrors,
+			TotalLatency: st.totalLatency,
+			AvgLatency:   avg,
+		})
+	}
+	return all
+}
+
+func (c *redisBusConnection) ListNodes() []bamgoo.NodeInfo {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	now := time.Now().UnixMilli()
+	out := make([]bamgoo.NodeInfo, 0, len(c.cache))
+	for _, item := range c.cache {
+		if c.announceTTL > 0 && now-item.Updated > c.announceTTL.Milliseconds() {
+			continue
+		}
+		item.Services = cloneStrings(item.Services)
+		out = append(out, item)
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Project == out[j].Project {
+			if out[i].Role == out[j].Role {
+				return out[i].Node < out[j].Node
+			}
+			return out[i].Role < out[j].Role
+		}
+		return out[i].Project < out[j].Project
+	})
+	return out
+}
+
+func (c *redisBusConnection) ListServices() []bamgoo.ServiceInfo {
+	nodes := c.ListNodes()
+	if len(nodes) == 0 {
+		return nil
+	}
+
+	merged := make(map[string]*bamgoo.ServiceInfo)
+	for _, node := range nodes {
+		for _, svc := range node.Services {
+			info, ok := merged[svc]
+			if !ok {
+				info = &bamgoo.ServiceInfo{Service: svc, Name: svc}
+				merged[svc] = info
+			}
+			info.Nodes = append(info.Nodes, bamgoo.ServiceNode{Node: node.Node, Role: node.Role})
+			if node.Updated > info.Updated {
+				info.Updated = node.Updated
+			}
+		}
+	}
+
+	out := make([]bamgoo.ServiceInfo, 0, len(merged))
+	for _, info := range merged {
+		sort.Slice(info.Nodes, func(i, j int) bool {
+			if info.Nodes[i].Role == info.Nodes[j].Role {
+				return info.Nodes[i].Node < info.Nodes[j].Node
+			}
+			return info.Nodes[i].Role < info.Nodes[j].Role
+		})
+		info.Instances = len(info.Nodes)
+		out = append(out, *info)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Service < out[j].Service })
+	return out
+}
+
+func (c *redisBusConnection) consumeCall(name, key string) {
+	defer c.wg.Done()
+	for {
+		select {
+		case <-c.done:
+			return
+		default:
+		}
+
+		values, err := c.client.BRPop(context.Background(), time.Second, key).Result()
+		if err != nil {
+			if errors.Is(err, redis.Nil) {
+				continue
+			}
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		if len(values) < 2 {
+			continue
+		}
+
+		req := requestMessage{}
+		if err := bamgoo.Unmarshal(bamgoo.JSON, []byte(values[1]), &req); err != nil {
+			continue
+		}
+
+		started := time.Now()
+		respBytes, callErr := c.handleCall(req.Data)
+		resp := responseMessage{}
+		if callErr != nil {
+			resp.Error = callErr.Error()
+			c.recordStats(name, time.Since(started), callErr)
+		} else {
+			resp.Data = respBytes
+			c.recordStats(name, time.Since(started), nil)
+		}
+
+		if strings.TrimSpace(req.Reply) == "" {
+			continue
+		}
+		payload, err := bamgoo.Marshal(bamgoo.JSON, resp)
+		if err != nil {
+			continue
+		}
+		_ = c.client.LPush(context.Background(), req.Reply, payload).Err()
+		_ = c.client.Expire(context.Background(), req.Reply, c.setting.ReplyTTL).Err()
+	}
+}
+
+func (c *redisBusConnection) consumeQueue(name, key string) {
+	defer c.wg.Done()
+	for {
+		select {
+		case <-c.done:
+			return
+		default:
+		}
+
+		values, err := c.client.BRPop(context.Background(), time.Second, key).Result()
+		if err != nil {
+			if errors.Is(err, redis.Nil) {
+				continue
+			}
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		if len(values) < 2 {
+			continue
+		}
+		started := time.Now()
+		asyncErr := c.handleAsync([]byte(values[1]))
+		c.recordStats(name, time.Since(started), asyncErr)
+	}
+}
+
+func (c *redisBusConnection) consumeEvent(name string, ps *redis.PubSub) {
+	defer c.wg.Done()
+	ch := ps.Channel()
+	for {
+		select {
+		case msg, ok := <-ch:
+			if !ok {
+				return
+			}
+			started := time.Now()
+			asyncErr := c.handleAsync([]byte(msg.Payload))
+			c.recordStats(name, time.Since(started), asyncErr)
+		case <-c.done:
+			return
+		}
+	}
+}
+
+func (c *redisBusConnection) consumeAnnounce(ps *redis.PubSub) {
+	defer c.wg.Done()
+	ch := ps.Channel()
+	for {
+		select {
+		case msg, ok := <-ch:
+			if !ok {
+				return
+			}
+			c.onAnnounce([]byte(msg.Payload))
+		case <-c.done:
+			return
+		}
+	}
+}
+
+func (c *redisBusConnection) announceLoop() {
+	defer c.wg.Done()
+	ticker := time.NewTicker(c.announceInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			c.publishAnnounce()
+		case <-c.done:
+			return
+		}
+	}
+}
+
+func (c *redisBusConnection) gcLoop() {
+	defer c.wg.Done()
+	interval := c.announceInterval
+	if interval <= 0 {
+		interval = defaultAnnouncePeriod
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			c.gcCache()
+		case <-c.done:
+			return
+		}
+	}
+}
+
+func (c *redisBusConnection) publishAnnounce() {
+	c.publishAnnounceState(true)
+}
+
+func (c *redisBusConnection) publishOffline() {
+	c.publishAnnounceState(false)
+}
+
+func (c *redisBusConnection) publishAnnounceState(online bool) {
+	if c.client == nil {
+		return
+	}
+	msg := announceMessage{
+		Project: c.identity.Project,
+		Node:    c.identity.Node,
+		Role:    c.identity.Role,
+		Updated: time.Now().UnixMilli(),
+	}
+	if online {
+		msg.Services = c.currentServices()
+	}
+	flag := online
+	msg.Online = &flag
+
+	data, err := bamgoo.Marshal(bamgoo.JSON, msg)
+	if err != nil {
+		return
+	}
+	_ = c.client.Publish(context.Background(), c.announceSubject(), data).Err()
+	c.onAnnounce(data)
+}
+
+func (c *redisBusConnection) onAnnounce(data []byte) {
+	msg := announceMessage{}
+	if err := bamgoo.Unmarshal(bamgoo.JSON, data, &msg); err != nil {
+		return
+	}
+	if strings.TrimSpace(msg.Node) == "" {
+		return
+	}
+	if strings.TrimSpace(msg.Project) == "" {
+		msg.Project = bamgoo.BAMGOO
+	}
+	online := true
+	if msg.Online != nil {
+		online = *msg.Online
+	}
+
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	key := msg.Project + "|" + msg.Node
+	if !online {
+		delete(c.cache, key)
+		return
+	}
+	c.cache[key] = bamgoo.NodeInfo{
+		Project:  msg.Project,
+		Node:     msg.Node,
+		Role:     msg.Role,
+		Services: uniqueStrings(msg.Services),
+		Updated:  msg.Updated,
+	}
+}
+
+func (c *redisBusConnection) gcCache() {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if c.announceTTL <= 0 {
+		return
+	}
+	now := time.Now().UnixMilli()
+	for key, item := range c.cache {
+		if now-item.Updated > c.announceTTL.Milliseconds() {
+			delete(c.cache, key)
+		}
+	}
+}
+
+func (c *redisBusConnection) currentServices() []string {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	names := make([]string, 0, len(c.subjects))
+	for name := range c.subjects {
+		names = append(names, c.serviceName(name))
+	}
+	sort.Strings(names)
+	return names
+}
+
+func (c *redisBusConnection) serviceName(subject string) string {
+	if c.setting.Prefix == "" {
+		return subject
+	}
+	return strings.TrimPrefix(subject, c.setting.Prefix)
+}
+
+func (c *redisBusConnection) announceSubject() string {
+	return c.systemSubject(systemAnnounceTopic)
+}
+
+func (c *redisBusConnection) replyKey() string {
+	id := bamgoo.Generate("reply")
+	return c.systemSubject(systemReplyTopic + "." + id)
+}
+
+func (c *redisBusConnection) systemPrefixValue() string {
+	if c.setting.Prefix != "" {
+		return strings.TrimSuffix(c.setting.Prefix, ".")
+	}
+	project := strings.TrimSpace(c.identity.Project)
+	if project == "" {
+		project = strings.TrimSpace(bamgoo.Project())
+	}
+	if project == "" {
+		project = bamgoo.BAMGOO
+	}
+	return project
+}
+
+func (c *redisBusConnection) systemSubject(msg string) string {
+	return "_" + c.systemPrefixValue() + "." + msg
+}
+
+func (c *redisBusConnection) handleCall(data []byte) ([]byte, error) {
+	if c.instance == nil {
+		c.instance = &bus.Instance{}
+	}
+	return c.instance.HandleCall(data)
+}
+
+func (c *redisBusConnection) handleAsync(data []byte) error {
+	if c.instance == nil {
+		c.instance = &bus.Instance{}
+	}
+	return c.instance.HandleAsync(data)
+}
+
+func (c *redisBusConnection) recordStats(subject string, cost time.Duration, err error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	st, ok := c.stats[subject]
+	if !ok {
+		st = &statsEntry{name: subject}
+		c.stats[subject] = st
+	}
+	st.numRequests++
+	st.totalLatency += cost.Milliseconds()
+	if err != nil {
+		st.numErrors++
+	}
+}
+
+func parseDurationSetting(v any) time.Duration {
+	switch vv := v.(type) {
+	case time.Duration:
+		return vv
+	case int:
+		return time.Second * time.Duration(vv)
+	case int64:
+		return time.Second * time.Duration(vv)
+	case float64:
+		return time.Second * time.Duration(vv)
+	case string:
+		if d, err := time.ParseDuration(vv); err == nil {
+			return d
+		}
+	}
+	return 0
+}
+
+func parseIntSetting(v any) (int, bool) {
+	switch vv := v.(type) {
+	case int:
+		return vv, true
+	case int64:
+		return int(vv), true
+	case float64:
+		return int(vv), true
+	case string:
+		n, err := strconv.Atoi(strings.TrimSpace(vv))
+		if err == nil {
+			return n, true
+		}
+	}
+	return 0, false
+}
+
+func uniqueStrings(in []string) []string {
+	if len(in) == 0 {
+		return []string{}
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, item := range in {
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		out = append(out, item)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func cloneStrings(in []string) []string {
+	out := make([]string, len(in))
+	copy(out, in)
+	return out
+}
+
+var _ bus.Connection = (*redisBusConnection)(nil)
