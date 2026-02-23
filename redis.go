@@ -93,7 +93,7 @@ type (
 	announceMessage struct {
 		Project  string   `json:"project"`
 		Node     string   `json:"node"`
-		Role     string   `json:"role"`
+		Profile  string   `json:"profile"`
 		Services []string `json:"services"`
 		Updated  int64    `json:"updated"`
 		Online   *bool    `json:"online,omitempty"`
@@ -164,7 +164,7 @@ func (d *redisBusDriver) Connect(inst *bus.Instance) (bus.Connection, error) {
 		setting.StopTimeout = defaultStopTimeout
 	}
 
-	project := strings.TrimSpace(bamgoo.Project())
+	project := strings.TrimSpace(bamgoo.Identity().Project)
 	if project == "" {
 		project = bamgoo.BAMGOO
 	}
@@ -173,9 +173,9 @@ func (d *redisBusDriver) Connect(inst *bus.Instance) (bus.Connection, error) {
 	if node == "" {
 		node = bamgoo.Generate("node")
 	}
-	role := strings.TrimSpace(identity.Role)
-	if role == "" {
-		role = bamgoo.BAMGOO
+	profile := strings.TrimSpace(identity.Profile)
+	if profile == "" {
+		profile = bamgoo.BAMGOO
 	}
 
 	return &redisBusConnection{
@@ -189,7 +189,7 @@ func (d *redisBusDriver) Connect(inst *bus.Instance) (bus.Connection, error) {
 		}),
 		subjects:         make(map[string]struct{}, 0),
 		pubsubs:          make([]*redis.PubSub, 0),
-		identity:         bamgoo.NodeInfo{Project: project, Node: node, Role: role},
+		identity:         bamgoo.NodeInfo{Project: project, Node: node, Profile: profile},
 		cache:            make(map[string]bamgoo.NodeInfo, 0),
 		announceInterval: setting.AnnounceInterval,
 		announceJitter:   setting.AnnounceJitter,
@@ -389,10 +389,10 @@ func (c *redisBusConnection) ListNodes() []bamgoo.NodeInfo {
 
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Project == out[j].Project {
-			if out[i].Role == out[j].Role {
+			if out[i].Profile == out[j].Profile {
 				return out[i].Node < out[j].Node
 			}
-			return out[i].Role < out[j].Role
+			return out[i].Profile < out[j].Profile
 		}
 		return out[i].Project < out[j].Project
 	})
@@ -413,7 +413,7 @@ func (c *redisBusConnection) ListServices() []bamgoo.ServiceInfo {
 				info = &bamgoo.ServiceInfo{Service: svc, Name: svc}
 				merged[svc] = info
 			}
-			info.Nodes = append(info.Nodes, bamgoo.ServiceNode{Node: node.Node, Role: node.Role})
+			info.Nodes = append(info.Nodes, bamgoo.ServiceNode{Node: node.Node, Profile: node.Profile})
 			if node.Updated > info.Updated {
 				info.Updated = node.Updated
 			}
@@ -423,10 +423,10 @@ func (c *redisBusConnection) ListServices() []bamgoo.ServiceInfo {
 	out := make([]bamgoo.ServiceInfo, 0, len(merged))
 	for _, info := range merged {
 		sort.Slice(info.Nodes, func(i, j int) bool {
-			if info.Nodes[i].Role == info.Nodes[j].Role {
+			if info.Nodes[i].Profile == info.Nodes[j].Profile {
 				return info.Nodes[i].Node < info.Nodes[j].Node
 			}
-			return info.Nodes[i].Role < info.Nodes[j].Role
+			return info.Nodes[i].Profile < info.Nodes[j].Profile
 		})
 		info.Instances = len(info.Nodes)
 		out = append(out, *info)
@@ -598,7 +598,7 @@ func (c *redisBusConnection) publishAnnounceState(online bool) {
 	msg := announceMessage{
 		Project: c.identity.Project,
 		Node:    c.identity.Node,
-		Role:    c.identity.Role,
+		Profile: c.identity.Profile,
 		Updated: time.Now().UnixMilli(),
 	}
 	if online {
@@ -644,7 +644,7 @@ func (c *redisBusConnection) onAnnounce(data []byte) {
 	c.cache[key] = bamgoo.NodeInfo{
 		Project:  msg.Project,
 		Node:     msg.Node,
-		Role:     msg.Role,
+		Profile:  msg.Profile,
 		Services: uniqueStrings(msg.Services),
 		Updated:  msg.Updated,
 	}
@@ -699,7 +699,7 @@ func (c *redisBusConnection) systemPrefixValue() string {
 	}
 	project := strings.TrimSpace(c.identity.Project)
 	if project == "" {
-		project = strings.TrimSpace(bamgoo.Project())
+		project = strings.TrimSpace(bamgoo.Identity().Project)
 	}
 	if project == "" {
 		project = bamgoo.BAMGOO
