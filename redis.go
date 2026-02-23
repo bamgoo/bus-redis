@@ -16,6 +16,7 @@ import (
 
 var (
 	errRedisInvalidConnection = errors.New("invalid redis connection")
+	errRedisStopTimeout       = errors.New("redis bus stop timeout")
 )
 
 const (
@@ -24,6 +25,7 @@ const (
 	defaultAnnouncePeriod  = 10 * time.Second
 	defaultAnnounceTimeout = 30 * time.Second
 	defaultReplyTTL        = 30 * time.Second
+	defaultStopTimeout     = 8 * time.Second
 )
 
 type (
@@ -62,6 +64,7 @@ type (
 		AnnounceInterval time.Duration
 		AnnounceTTL      time.Duration
 		ReplyTTL         time.Duration
+		StopTimeout      time.Duration
 	}
 
 	statsEntry struct {
@@ -142,6 +145,10 @@ func (d *redisBusDriver) Connect(inst *bus.Instance) (bus.Connection, error) {
 	setting.ReplyTTL = parseDurationSetting(cfg["reply_ttl"])
 	if setting.ReplyTTL <= 0 {
 		setting.ReplyTTL = defaultReplyTTL
+	}
+	setting.StopTimeout = parseDurationSetting(cfg["stop_timeout"])
+	if setting.StopTimeout <= 0 {
+		setting.StopTimeout = defaultStopTimeout
 	}
 
 	project := strings.TrimSpace(bamgoo.Project())
@@ -253,7 +260,6 @@ func (c *redisBusConnection) Stop() error {
 	pubsubs := c.pubsubs
 	c.pubsubs = nil
 	done := c.done
-	c.done = make(chan struct{})
 	c.running = false
 	c.mutex.Unlock()
 
@@ -263,9 +269,20 @@ func (c *redisBusConnection) Stop() error {
 	for _, ps := range pubsubs {
 		_ = ps.Close()
 	}
-	c.wg.Wait()
-
-	return nil
+	waitDone := make(chan struct{})
+	go func() {
+		c.wg.Wait()
+		close(waitDone)
+	}()
+	select {
+	case <-waitDone:
+		c.mutex.Lock()
+		c.done = make(chan struct{})
+		c.mutex.Unlock()
+		return nil
+	case <-time.After(c.setting.StopTimeout):
+		return errRedisStopTimeout
+	}
 }
 
 func (c *redisBusConnection) Request(subject string, data []byte, timeout time.Duration) ([]byte, error) {
@@ -574,7 +591,9 @@ func (c *redisBusConnection) publishAnnounceState(online bool) {
 	if err != nil {
 		return
 	}
-	_ = c.client.Publish(context.Background(), c.announceSubject(), data).Err()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_ = c.client.Publish(ctx, c.announceSubject(), data).Err()
 	c.onAnnounce(data)
 }
 
