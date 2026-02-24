@@ -28,6 +28,7 @@ const (
 	defaultAnnounceJitter  = 2 * time.Second
 	defaultReplyTTL        = 30 * time.Second
 	defaultStopTimeout     = 8 * time.Second
+	defaultQueueIdle       = 30 * time.Second
 )
 
 type (
@@ -50,6 +51,10 @@ type (
 		announceInterval time.Duration
 		announceJitter   time.Duration
 		announceTTL      time.Duration
+		queueIdle        time.Duration
+		queueGroup       string
+		publishGroup     string
+		queueConsumer    string
 		done             chan struct{}
 		wg               sync.WaitGroup
 
@@ -70,6 +75,9 @@ type (
 		AnnounceTTL      time.Duration
 		ReplyTTL         time.Duration
 		StopTimeout      time.Duration
+		QueueIdle        time.Duration
+		QueueGroup       string
+		PublishGroup     string
 	}
 
 	statsEntry struct {
@@ -163,6 +171,22 @@ func (d *redisBusDriver) Connect(inst *bus.Instance) (bus.Connection, error) {
 	if setting.StopTimeout <= 0 {
 		setting.StopTimeout = defaultStopTimeout
 	}
+	setting.QueueIdle = parseDurationSetting(cfg["queue_idle"])
+	if setting.QueueIdle <= 0 {
+		setting.QueueIdle = defaultQueueIdle
+	}
+	if v, ok := cfg["queue_group"].(string); ok {
+		setting.QueueGroup = strings.TrimSpace(v)
+	}
+	if v := strings.TrimSpace(inst.Config.Group); v != "" {
+		setting.PublishGroup = v
+	}
+	if v, ok := cfg["group"].(string); ok && strings.TrimSpace(v) != "" {
+		setting.PublishGroup = strings.TrimSpace(v)
+	}
+	if v, ok := cfg["profile"].(string); ok && strings.TrimSpace(v) != "" {
+		setting.PublishGroup = strings.TrimSpace(v)
+	}
 
 	project := strings.TrimSpace(bamgoo.Identity().Project)
 	if project == "" {
@@ -194,6 +218,7 @@ func (d *redisBusDriver) Connect(inst *bus.Instance) (bus.Connection, error) {
 		announceInterval: setting.AnnounceInterval,
 		announceJitter:   setting.AnnounceJitter,
 		announceTTL:      setting.AnnounceTTL,
+		queueIdle:        setting.QueueIdle,
 		done:             make(chan struct{}),
 		stats:            make(map[string]*statsEntry, 0),
 		rnd:              rand.New(rand.NewSource(time.Now().UnixNano())),
@@ -235,13 +260,24 @@ func (c *redisBusConnection) Start() error {
 	for base := range c.subjects {
 		callKey := "call." + base
 		queueKey := "queue." + base
+		groupKey := "publish." + base
 		eventKey := "event." + base
 
 		c.wg.Add(1)
 		go c.consumeCall(base, callKey)
 
+		if err := c.ensureQueueGroup(queueKey, c.resolveQueueGroup()); err != nil {
+			c.mutex.Unlock()
+			return err
+		}
+		if err := c.ensureQueueGroup(groupKey, c.resolvePublishGroup()); err != nil {
+			c.mutex.Unlock()
+			return err
+		}
 		c.wg.Add(1)
-		go c.consumeQueue(base, queueKey)
+		go c.consumeQueue(base, queueKey, c.resolveQueueGroup())
+		c.wg.Add(1)
+		go c.consumeQueue(base, groupKey, c.resolvePublishGroup())
 
 		ps := c.client.Subscribe(context.Background(), eventKey)
 		c.pubsubs = append(c.pubsubs, ps)
@@ -255,6 +291,8 @@ func (c *redisBusConnection) Start() error {
 	go c.consumeAnnounce(announceSub)
 
 	c.running = true
+	c.queueGroup = c.resolveQueueGroup()
+	c.queueConsumer = c.resolveQueueConsumer()
 	c.mutex.Unlock()
 
 	c.publishAnnounce()
@@ -348,7 +386,12 @@ func (c *redisBusConnection) Enqueue(subject string, data []byte) error {
 	if c.client == nil {
 		return errRedisInvalidConnection
 	}
-	return c.client.LPush(context.Background(), subject, data).Err()
+	return c.client.XAdd(context.Background(), &redis.XAddArgs{
+		Stream: subject,
+		Values: map[string]any{
+			"d": data,
+		},
+	}).Err()
 }
 
 func (c *redisBusConnection) Stats() []bamgoo.ServiceStats {
@@ -484,8 +527,15 @@ func (c *redisBusConnection) consumeCall(name, key string) {
 	}
 }
 
-func (c *redisBusConnection) consumeQueue(name, key string) {
+func (c *redisBusConnection) consumeQueue(name, key, group string) {
 	defer c.wg.Done()
+	consumer := c.resolveQueueConsumer()
+	idle := c.queueIdle
+	if idle <= 0 {
+		idle = defaultQueueIdle
+	}
+	_ = c.ensureQueueGroup(key, group)
+
 	for {
 		select {
 		case <-c.done:
@@ -493,7 +543,30 @@ func (c *redisBusConnection) consumeQueue(name, key string) {
 		default:
 		}
 
-		values, err := c.client.BRPop(context.Background(), time.Second, key).Result()
+		// reclaim stale pending entries first for at-least-once semantics.
+		claimed, _, claimErr := c.client.XAutoClaim(context.Background(), &redis.XAutoClaimArgs{
+			Stream:   key,
+			Group:    group,
+			Consumer: consumer,
+			MinIdle:  idle,
+			Start:    "0-0",
+			Count:    1,
+		}).Result()
+		if claimErr != nil && !errors.Is(claimErr, redis.Nil) {
+			time.Sleep(100 * time.Millisecond)
+		}
+		if len(claimed) > 0 {
+			c.handleQueueStreams(name, key, group, claimed)
+			continue
+		}
+
+		streams, err := c.client.XReadGroup(context.Background(), &redis.XReadGroupArgs{
+			Group:    group,
+			Consumer: consumer,
+			Streams:  []string{key, ">"},
+			Count:    1,
+			Block:    time.Second,
+		}).Result()
 		if err != nil {
 			if errors.Is(err, redis.Nil) {
 				continue
@@ -501,13 +574,91 @@ func (c *redisBusConnection) consumeQueue(name, key string) {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		if len(values) < 2 {
+		for _, stream := range streams {
+			if len(stream.Messages) == 0 {
+				continue
+			}
+			c.handleQueueStreams(name, key, group, stream.Messages)
+		}
+	}
+}
+
+func (c *redisBusConnection) handleQueueStreams(name, key, group string, messages []redis.XMessage) {
+	for _, msg := range messages {
+		raw, ok := msg.Values["d"]
+		if !ok {
+			_ = c.client.XAck(context.Background(), key, group, msg.ID).Err()
+			_ = c.client.XDel(context.Background(), key, msg.ID).Err()
 			continue
 		}
+
+		data, ok := bytesFromRedisValue(raw)
+		if !ok {
+			_ = c.client.XAck(context.Background(), key, group, msg.ID).Err()
+			_ = c.client.XDel(context.Background(), key, msg.ID).Err()
+			continue
+		}
+
 		started := time.Now()
-		asyncErr := c.handleAsync([]byte(values[1]))
+		asyncErr := c.handleAsync(data)
 		c.recordStats(name, time.Since(started), asyncErr)
+		if asyncErr == nil {
+			_ = c.client.XAck(context.Background(), key, group, msg.ID).Err()
+			_ = c.client.XDel(context.Background(), key, msg.ID).Err()
+		}
 	}
+}
+
+func (c *redisBusConnection) ensureQueueGroup(stream, group string) error {
+	err := c.client.XGroupCreateMkStream(context.Background(), stream, group, "0").Err()
+	if err == nil {
+		return nil
+	}
+	if strings.Contains(strings.ToUpper(err.Error()), "BUSYGROUP") {
+		return nil
+	}
+	return err
+}
+
+func (c *redisBusConnection) resolveQueueGroup() string {
+	if c.queueGroup != "" {
+		return c.queueGroup
+	}
+	group := strings.TrimSpace(c.setting.QueueGroup)
+	if group != "" {
+		c.queueGroup = group
+		return group
+	}
+	group = "_qg." + c.systemPrefixValue()
+	c.queueGroup = group
+	return group
+}
+
+func (c *redisBusConnection) resolvePublishGroup() string {
+	if c.publishGroup != "" {
+		return c.publishGroup
+	}
+	group := strings.TrimSpace(c.setting.PublishGroup)
+	if group == "" {
+		group = strings.TrimSpace(c.identity.Profile)
+	}
+	if group == "" {
+		group = bamgoo.GLOBAL
+	}
+	c.publishGroup = "_pg." + group
+	return c.publishGroup
+}
+
+func (c *redisBusConnection) resolveQueueConsumer() string {
+	if c.queueConsumer != "" {
+		return c.queueConsumer
+	}
+	name := strings.TrimSpace(c.identity.Node)
+	if name == "" {
+		name = bamgoo.Generate("node")
+	}
+	c.queueConsumer = "q." + name
+	return c.queueConsumer
 }
 
 func (c *redisBusConnection) consumeEvent(name string, ps *redis.PubSub) {
@@ -779,6 +930,17 @@ func parseDurationSetting(v any) time.Duration {
 		}
 	}
 	return 0
+}
+
+func bytesFromRedisValue(v any) ([]byte, bool) {
+	switch vv := v.(type) {
+	case []byte:
+		return vv, true
+	case string:
+		return []byte(vv), true
+	default:
+		return nil, false
+	}
 }
 
 func parseIntSetting(v any) (int, bool) {
