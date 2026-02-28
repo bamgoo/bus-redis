@@ -13,6 +13,7 @@ import (
 	"github.com/bamgoo/bamgoo"
 	"github.com/bamgoo/bus"
 	"github.com/redis/go-redis/v9"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 var (
@@ -348,7 +349,7 @@ func (c *redisBusConnection) Request(subject string, data []byte, timeout time.D
 
 	replyKey := c.replyKey()
 	req := requestMessage{ID: bamgoo.Generate("req"), Reply: replyKey, Data: data}
-	body, err := bamgoo.Marshal(bamgoo.JSON, req)
+	body, err := msgpack.Marshal(req)
 	if err != nil {
 		return nil, err
 	}
@@ -365,8 +366,12 @@ func (c *redisBusConnection) Request(subject string, data []byte, timeout time.D
 	}
 	_ = c.client.Del(context.Background(), replyKey).Err()
 
+	replyBytes, ok := bytesFromRedisValue(values[1])
+	if !ok {
+		return nil, errors.New("invalid reply payload")
+	}
 	res := responseMessage{}
-	if err := bamgoo.Unmarshal(bamgoo.JSON, []byte(values[1]), &res); err != nil {
+	if err := msgpack.Unmarshal(replyBytes, &res); err != nil {
 		return nil, err
 	}
 	if strings.TrimSpace(res.Error) != "" {
@@ -498,9 +503,13 @@ func (c *redisBusConnection) consumeCall(name, key string) {
 		if len(values) < 2 {
 			continue
 		}
+		reqBytes, ok := bytesFromRedisValue(values[1])
+		if !ok {
+			continue
+		}
 
 		req := requestMessage{}
-		if err := bamgoo.Unmarshal(bamgoo.JSON, []byte(values[1]), &req); err != nil {
+		if err := msgpack.Unmarshal(reqBytes, &req); err != nil {
 			continue
 		}
 
@@ -518,7 +527,7 @@ func (c *redisBusConnection) consumeCall(name, key string) {
 		if strings.TrimSpace(req.Reply) == "" {
 			continue
 		}
-		payload, err := bamgoo.Marshal(bamgoo.JSON, resp)
+		payload, err := msgpack.Marshal(resp)
 		if err != nil {
 			continue
 		}
@@ -758,7 +767,7 @@ func (c *redisBusConnection) publishAnnounceState(online bool) {
 	flag := online
 	msg.Online = &flag
 
-	data, err := bamgoo.Marshal(bamgoo.JSON, msg)
+	data, err := msgpack.Marshal(msg)
 	if err != nil {
 		return
 	}
@@ -770,7 +779,7 @@ func (c *redisBusConnection) publishAnnounceState(online bool) {
 
 func (c *redisBusConnection) onAnnounce(data []byte) {
 	msg := announceMessage{}
-	if err := bamgoo.Unmarshal(bamgoo.JSON, data, &msg); err != nil {
+	if err := msgpack.Unmarshal(data, &msg); err != nil {
 		return
 	}
 	if strings.TrimSpace(msg.Node) == "" {
