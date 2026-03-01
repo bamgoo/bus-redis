@@ -1,4 +1,4 @@
-module github.com/bamgoo/bus-redis
+module github.com/infrago/bus-redis
 
 go 1.25.3
 

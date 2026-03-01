@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bamgoo/bamgoo"
-	"github.com/bamgoo/bus"
+	"github.com/infrago/infra"
+	"github.com/infrago/bus"
 	"github.com/redis/go-redis/v9"
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -46,8 +46,8 @@ type (
 		subjects map[string]struct{}
 		pubsubs  []*redis.PubSub
 
-		identity bamgoo.NodeInfo
-		cache    map[string]bamgoo.NodeInfo
+		identity infra.NodeInfo
+		cache    map[string]infra.NodeInfo
 
 		announceInterval time.Duration
 		announceJitter   time.Duration
@@ -110,7 +110,7 @@ type (
 )
 
 func init() {
-	bamgoo.Register("redis", &redisBusDriver{})
+	infra.Register("redis", &redisBusDriver{})
 }
 
 func (d *redisBusDriver) Connect(inst *bus.Instance) (bus.Connection, error) {
@@ -189,18 +189,18 @@ func (d *redisBusDriver) Connect(inst *bus.Instance) (bus.Connection, error) {
 		setting.PublishGroup = strings.TrimSpace(v)
 	}
 
-	project := strings.TrimSpace(bamgoo.Identity().Project)
+	project := strings.TrimSpace(infra.Identity().Project)
 	if project == "" {
-		project = bamgoo.BAMGOO
+		project = infra.INFRAGO
 	}
-	identity := bamgoo.Identity()
+	identity := infra.Identity()
 	node := strings.TrimSpace(identity.Node)
 	if node == "" {
-		node = bamgoo.Generate("node")
+		node = infra.Generate("node")
 	}
 	profile := strings.TrimSpace(identity.Profile)
 	if profile == "" {
-		profile = bamgoo.BAMGOO
+		profile = infra.INFRAGO
 	}
 
 	return &redisBusConnection{
@@ -214,8 +214,8 @@ func (d *redisBusDriver) Connect(inst *bus.Instance) (bus.Connection, error) {
 		}),
 		subjects:         make(map[string]struct{}, 0),
 		pubsubs:          make([]*redis.PubSub, 0),
-		identity:         bamgoo.NodeInfo{Project: project, Node: node, Profile: profile},
-		cache:            make(map[string]bamgoo.NodeInfo, 0),
+		identity:         infra.NodeInfo{Project: project, Node: node, Profile: profile},
+		cache:            make(map[string]infra.NodeInfo, 0),
 		announceInterval: setting.AnnounceInterval,
 		announceJitter:   setting.AnnounceJitter,
 		announceTTL:      setting.AnnounceTTL,
@@ -348,7 +348,7 @@ func (c *redisBusConnection) Request(subject string, data []byte, timeout time.D
 	}
 
 	replyKey := c.replyKey()
-	req := requestMessage{ID: bamgoo.Generate("req"), Reply: replyKey, Data: data}
+	req := requestMessage{ID: infra.Generate("req"), Reply: replyKey, Data: data}
 	body, err := msgpack.Marshal(req)
 	if err != nil {
 		return nil, err
@@ -399,17 +399,17 @@ func (c *redisBusConnection) Enqueue(subject string, data []byte) error {
 	}).Err()
 }
 
-func (c *redisBusConnection) Stats() []bamgoo.ServiceStats {
+func (c *redisBusConnection) Stats() []infra.ServiceStats {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 
-	all := make([]bamgoo.ServiceStats, 0, len(c.stats))
+	all := make([]infra.ServiceStats, 0, len(c.stats))
 	for _, st := range c.stats {
 		avg := int64(0)
 		if st.numRequests > 0 {
 			avg = st.totalLatency / int64(st.numRequests)
 		}
-		all = append(all, bamgoo.ServiceStats{
+		all = append(all, infra.ServiceStats{
 			Name:         st.name,
 			Version:      c.setting.Version,
 			NumRequests:  st.numRequests,
@@ -421,12 +421,12 @@ func (c *redisBusConnection) Stats() []bamgoo.ServiceStats {
 	return all
 }
 
-func (c *redisBusConnection) ListNodes() []bamgoo.NodeInfo {
+func (c *redisBusConnection) ListNodes() []infra.NodeInfo {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 
 	now := time.Now().UnixMilli()
-	out := make([]bamgoo.NodeInfo, 0, len(c.cache))
+	out := make([]infra.NodeInfo, 0, len(c.cache))
 	for _, item := range c.cache {
 		if c.announceTTL > 0 && now-item.Updated > c.announceTTL.Milliseconds() {
 			continue
@@ -447,28 +447,28 @@ func (c *redisBusConnection) ListNodes() []bamgoo.NodeInfo {
 	return out
 }
 
-func (c *redisBusConnection) ListServices() []bamgoo.ServiceInfo {
+func (c *redisBusConnection) ListServices() []infra.ServiceInfo {
 	nodes := c.ListNodes()
 	if len(nodes) == 0 {
 		return nil
 	}
 
-	merged := make(map[string]*bamgoo.ServiceInfo)
+	merged := make(map[string]*infra.ServiceInfo)
 	for _, node := range nodes {
 		for _, svc := range node.Services {
 			info, ok := merged[svc]
 			if !ok {
-				info = &bamgoo.ServiceInfo{Service: svc, Name: svc}
+				info = &infra.ServiceInfo{Service: svc, Name: svc}
 				merged[svc] = info
 			}
-			info.Nodes = append(info.Nodes, bamgoo.ServiceNode{Node: node.Node, Profile: node.Profile})
+			info.Nodes = append(info.Nodes, infra.ServiceNode{Node: node.Node, Profile: node.Profile})
 			if node.Updated > info.Updated {
 				info.Updated = node.Updated
 			}
 		}
 	}
 
-	out := make([]bamgoo.ServiceInfo, 0, len(merged))
+	out := make([]infra.ServiceInfo, 0, len(merged))
 	for _, info := range merged {
 		sort.Slice(info.Nodes, func(i, j int) bool {
 			if info.Nodes[i].Profile == info.Nodes[j].Profile {
@@ -652,7 +652,7 @@ func (c *redisBusConnection) resolvePublishGroup() string {
 		group = strings.TrimSpace(c.identity.Profile)
 	}
 	if group == "" {
-		group = bamgoo.GLOBAL
+		group = infra.GLOBAL
 	}
 	c.publishGroup = "_pg." + group
 	return c.publishGroup
@@ -664,7 +664,7 @@ func (c *redisBusConnection) resolveQueueConsumer() string {
 	}
 	name := strings.TrimSpace(c.identity.Node)
 	if name == "" {
-		name = bamgoo.Generate("node")
+		name = infra.Generate("node")
 	}
 	c.queueConsumer = "q." + name
 	return c.queueConsumer
@@ -786,7 +786,7 @@ func (c *redisBusConnection) onAnnounce(data []byte) {
 		return
 	}
 	if strings.TrimSpace(msg.Project) == "" {
-		msg.Project = bamgoo.BAMGOO
+		msg.Project = infra.INFRAGO
 	}
 	online := true
 	if msg.Online != nil {
@@ -801,7 +801,7 @@ func (c *redisBusConnection) onAnnounce(data []byte) {
 		delete(c.cache, key)
 		return
 	}
-	c.cache[key] = bamgoo.NodeInfo{
+	c.cache[key] = infra.NodeInfo{
 		Project:  msg.Project,
 		Node:     msg.Node,
 		Profile:  msg.Profile,
@@ -849,7 +849,7 @@ func (c *redisBusConnection) announceSubject() string {
 }
 
 func (c *redisBusConnection) replyKey() string {
-	id := bamgoo.Generate("reply")
+	id := infra.Generate("reply")
 	return c.systemSubject(systemReplyTopic + "." + id)
 }
 
@@ -859,10 +859,10 @@ func (c *redisBusConnection) systemPrefixValue() string {
 	}
 	project := strings.TrimSpace(c.identity.Project)
 	if project == "" {
-		project = strings.TrimSpace(bamgoo.Identity().Project)
+		project = strings.TrimSpace(infra.Identity().Project)
 	}
 	if project == "" {
-		project = bamgoo.BAMGOO
+		project = infra.INFRAGO
 	}
 	return project
 }

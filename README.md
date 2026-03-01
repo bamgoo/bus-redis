@@ -1,2 +1,2 @@
 # bus-redis
-bamgoo redis bus driver.
+infrago redis bus driver.
