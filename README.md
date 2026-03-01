@@ -1,51 +1,33 @@
 # bus-redis
 
-`bus-redis` 是 `bus` 模块的 `redis` 驱动。
+`bus-redis` 是 `github.com/infrago/bus` 的**redis 驱动**。
 
-## 安装
+## 包定位
 
-```bash
-go get github.com/infrago/bus@latest
-go get github.com/infrago/bus-redis@latest
-```
+- 类型：驱动
+- 作用：把 `bus` 模块的统一接口落到 `redis` 后端实现
 
-## 接入
+## 快速接入
 
 ```go
 import (
     _ "github.com/infrago/bus"
     _ "github.com/infrago/bus-redis"
-    "github.com/infrago/infra"
 )
-
-func main() {
-    infra.Run()
-}
 ```
-
-## 配置示例
 
 ```toml
 [bus]
 driver = "redis"
 ```
 
-## 公开 API（摘自源码）
+## `setting` 专用配置项
 
-- `func (d *redisBusDriver) Connect(inst *bus.Instance) (bus.Connection, error)`
-- `func (c *redisBusConnection) Register(subject string) error`
-- `func (c *redisBusConnection) Open() error`
-- `func (c *redisBusConnection) Close() error`
-- `func (c *redisBusConnection) Start() error`
-- `func (c *redisBusConnection) Stop() error`
-- `func (c *redisBusConnection) Request(subject string, data []byte, timeout time.Duration) ([]byte, error)`
-- `func (c *redisBusConnection) Publish(subject string, data []byte) error`
-- `func (c *redisBusConnection) Enqueue(subject string, data []byte) error`
-- `func (c *redisBusConnection) Stats() []infra.ServiceStats`
-- `func (c *redisBusConnection) ListNodes() []infra.NodeInfo`
-- `func (c *redisBusConnection) ListServices() []infra.ServiceInfo`
+配置位置：`[bus].setting`
 
-## 排错
+- 当前驱动源码未检测到显式 `setting` 键读取，请查看驱动实现
 
-- driver 未生效：确认模块段 `driver` 值与驱动名一致
-- 连接失败：检查 endpoint/host/port/鉴权配置
+## 说明
+
+- `setting` 仅对当前驱动生效，不同驱动键名可能不同
+- 连接失败时优先核对 `setting` 中 host/port/认证/超时等参数
