@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/infrago/infra"
 	"github.com/infrago/bus"
+	"github.com/infrago/infra"
 	"github.com/redis/go-redis/v9"
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -102,6 +102,7 @@ type (
 	announceMessage struct {
 		Project  string   `json:"project"`
 		Node     string   `json:"node"`
+		Role     string   `json:"role"`
 		Profile  string   `json:"profile"`
 		Services []string `json:"services"`
 		Updated  int64    `json:"updated"`
@@ -181,11 +182,11 @@ func (d *redisBusDriver) Connect(inst *bus.Instance) (bus.Connection, error) {
 	}
 	if v := strings.TrimSpace(inst.Config.Group); v != "" {
 		setting.PublishGroup = v
-	}
-	if v, ok := cfg["group"].(string); ok && strings.TrimSpace(v) != "" {
+	} else if v, ok := cfg["group"].(string); ok && strings.TrimSpace(v) != "" {
 		setting.PublishGroup = strings.TrimSpace(v)
-	}
-	if v, ok := cfg["profile"].(string); ok && strings.TrimSpace(v) != "" {
+	} else if v, ok := cfg["role"].(string); ok && strings.TrimSpace(v) != "" {
+		setting.PublishGroup = strings.TrimSpace(v)
+	} else if v, ok := cfg["profile"].(string); ok && strings.TrimSpace(v) != "" {
 		setting.PublishGroup = strings.TrimSpace(v)
 	}
 
@@ -202,6 +203,10 @@ func (d *redisBusDriver) Connect(inst *bus.Instance) (bus.Connection, error) {
 	if profile == "" {
 		profile = infra.INFRAGO
 	}
+	role := strings.TrimSpace(identity.Role)
+	if role == "" {
+		role = profile
+	}
 
 	return &redisBusConnection{
 		instance: inst,
@@ -214,7 +219,7 @@ func (d *redisBusDriver) Connect(inst *bus.Instance) (bus.Connection, error) {
 		}),
 		subjects:         make(map[string]struct{}, 0),
 		pubsubs:          make([]*redis.PubSub, 0),
-		identity:         infra.NodeInfo{Project: project, Node: node, Profile: profile},
+		identity:         infra.NodeInfo{Project: project, Node: node, Role: role, Profile: profile},
 		cache:            make(map[string]infra.NodeInfo, 0),
 		announceInterval: setting.AnnounceInterval,
 		announceJitter:   setting.AnnounceJitter,
@@ -437,10 +442,13 @@ func (c *redisBusConnection) ListNodes() []infra.NodeInfo {
 
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Project == out[j].Project {
-			if out[i].Profile == out[j].Profile {
-				return out[i].Node < out[j].Node
+			if out[i].Role == out[j].Role {
+				if out[i].Profile == out[j].Profile {
+					return out[i].Node < out[j].Node
+				}
+				return out[i].Profile < out[j].Profile
 			}
-			return out[i].Profile < out[j].Profile
+			return out[i].Role < out[j].Role
 		}
 		return out[i].Project < out[j].Project
 	})
@@ -461,7 +469,7 @@ func (c *redisBusConnection) ListServices() []infra.ServiceInfo {
 				info = &infra.ServiceInfo{Service: svc, Name: svc}
 				merged[svc] = info
 			}
-			info.Nodes = append(info.Nodes, infra.ServiceNode{Node: node.Node, Profile: node.Profile})
+			info.Nodes = append(info.Nodes, infra.ServiceNode{Node: node.Node, Role: node.Role, Profile: node.Profile})
 			if node.Updated > info.Updated {
 				info.Updated = node.Updated
 			}
@@ -471,10 +479,13 @@ func (c *redisBusConnection) ListServices() []infra.ServiceInfo {
 	out := make([]infra.ServiceInfo, 0, len(merged))
 	for _, info := range merged {
 		sort.Slice(info.Nodes, func(i, j int) bool {
-			if info.Nodes[i].Profile == info.Nodes[j].Profile {
-				return info.Nodes[i].Node < info.Nodes[j].Node
+			if info.Nodes[i].Role == info.Nodes[j].Role {
+				if info.Nodes[i].Profile == info.Nodes[j].Profile {
+					return info.Nodes[i].Node < info.Nodes[j].Node
+				}
+				return info.Nodes[i].Profile < info.Nodes[j].Profile
 			}
-			return info.Nodes[i].Profile < info.Nodes[j].Profile
+			return info.Nodes[i].Role < info.Nodes[j].Role
 		})
 		info.Instances = len(info.Nodes)
 		out = append(out, *info)
@@ -649,7 +660,7 @@ func (c *redisBusConnection) resolvePublishGroup() string {
 	}
 	group := strings.TrimSpace(c.setting.PublishGroup)
 	if group == "" {
-		group = strings.TrimSpace(c.identity.Profile)
+		group = strings.TrimSpace(c.identity.Role)
 	}
 	if group == "" {
 		group = infra.GLOBAL
@@ -758,6 +769,7 @@ func (c *redisBusConnection) publishAnnounceState(online bool) {
 	msg := announceMessage{
 		Project: c.identity.Project,
 		Node:    c.identity.Node,
+		Role:    c.identity.Role,
 		Profile: c.identity.Profile,
 		Updated: time.Now().UnixMilli(),
 	}
@@ -804,6 +816,7 @@ func (c *redisBusConnection) onAnnounce(data []byte) {
 	c.cache[key] = infra.NodeInfo{
 		Project:  msg.Project,
 		Node:     msg.Node,
+		Role:     msg.Role,
 		Profile:  msg.Profile,
 		Services: uniqueStrings(msg.Services),
 		Updated:  msg.Updated,
