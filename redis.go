@@ -43,7 +43,9 @@ type (
 		setting  redisBusSetting
 		client   *redis.Client
 
-		subjects map[string]struct{}
+		services map[string]struct{}
+		messages map[string]struct{}
+		retries  map[string][]time.Duration
 		pubsubs  []*redis.PubSub
 
 		identity infra.NodeInfo
@@ -217,7 +219,9 @@ func (d *redisBusDriver) Connect(inst *bus.Instance) (bus.Connection, error) {
 			Password: setting.Password,
 			DB:       setting.Database,
 		}),
-		subjects:         make(map[string]struct{}, 0),
+		services:         make(map[string]struct{}, 0),
+		messages:         make(map[string]struct{}, 0),
+		retries:          make(map[string][]time.Duration, 0),
 		pubsubs:          make([]*redis.PubSub, 0),
 		identity:         infra.NodeInfo{Project: project, Node: node, Role: role, Profile: profile},
 		cache:            make(map[string]infra.NodeInfo, 0),
@@ -231,9 +235,17 @@ func (d *redisBusDriver) Connect(inst *bus.Instance) (bus.Connection, error) {
 	}, nil
 }
 
-func (c *redisBusConnection) Register(subject string) error {
+func (c *redisBusConnection) RegisterService(subject string, retries []time.Duration) error {
 	c.mutex.Lock()
-	c.subjects[subject] = struct{}{}
+	c.services[subject] = struct{}{}
+	c.retries[subject] = append([]time.Duration{}, retries...)
+	c.mutex.Unlock()
+	return nil
+}
+
+func (c *redisBusConnection) RegisterMessage(subject string) error {
+	c.mutex.Lock()
+	c.messages[subject] = struct{}{}
 	c.mutex.Unlock()
 	return nil
 }
@@ -263,11 +275,9 @@ func (c *redisBusConnection) Start() error {
 		return errRedisInvalidConnection
 	}
 
-	for base := range c.subjects {
+	for base := range c.services {
 		callKey := "call." + base
 		queueKey := "queue." + base
-		groupKey := "publish." + base
-		eventKey := "event." + base
 
 		c.wg.Add(1)
 		go c.consumeCall(base, callKey)
@@ -276,19 +286,25 @@ func (c *redisBusConnection) Start() error {
 			c.mutex.Unlock()
 			return err
 		}
+		c.wg.Add(1)
+		go c.consumeQueue(base, queueKey, c.resolveQueueGroup(), nil, true, c.retries[base])
+	}
+
+	for base := range c.messages {
+		groupKey := "publish." + base
+		eventKey := "event." + base
+
 		if err := c.ensureQueueGroup(groupKey, c.resolvePublishGroup()); err != nil {
 			c.mutex.Unlock()
 			return err
 		}
 		c.wg.Add(1)
-		go c.consumeQueue(base, queueKey, c.resolveQueueGroup())
-		c.wg.Add(1)
-		go c.consumeQueue(base, groupKey, c.resolvePublishGroup())
+		go c.consumeQueue(base, groupKey, c.resolvePublishGroup(), c.handleMessage, false, nil)
 
 		ps := c.client.Subscribe(context.Background(), eventKey)
 		c.pubsubs = append(c.pubsubs, ps)
 		c.wg.Add(1)
-		go c.consumeEvent(base, ps)
+		go c.consumeEvent(base, ps, c.handleMessage)
 	}
 
 	announceSub := c.client.Subscribe(context.Background(), c.announceSubject())
@@ -396,12 +412,7 @@ func (c *redisBusConnection) Enqueue(subject string, data []byte) error {
 	if c.client == nil {
 		return errRedisInvalidConnection
 	}
-	return c.client.XAdd(context.Background(), &redis.XAddArgs{
-		Stream: subject,
-		Values: map[string]any{
-			"d": data,
-		},
-	}).Err()
+	return c.enqueueQueue(subject, data, 1, 0)
 }
 
 func (c *redisBusConnection) Stats() []infra.ServiceStats {
@@ -547,7 +558,7 @@ func (c *redisBusConnection) consumeCall(name, key string) {
 	}
 }
 
-func (c *redisBusConnection) consumeQueue(name, key, group string) {
+func (c *redisBusConnection) consumeQueue(name, key, group string, handler func([]byte) error, retryable bool, retries []time.Duration) {
 	defer c.wg.Done()
 	consumer := c.resolveQueueConsumer()
 	idle := c.queueIdle
@@ -576,7 +587,7 @@ func (c *redisBusConnection) consumeQueue(name, key, group string) {
 			time.Sleep(100 * time.Millisecond)
 		}
 		if len(claimed) > 0 {
-			c.handleQueueStreams(name, key, group, claimed)
+			c.handleQueueStreams(name, key, group, claimed, handler, retryable, retries)
 			continue
 		}
 
@@ -598,12 +609,12 @@ func (c *redisBusConnection) consumeQueue(name, key, group string) {
 			if len(stream.Messages) == 0 {
 				continue
 			}
-			c.handleQueueStreams(name, key, group, stream.Messages)
+			c.handleQueueStreams(name, key, group, stream.Messages, handler, retryable, retries)
 		}
 	}
 }
 
-func (c *redisBusConnection) handleQueueStreams(name, key, group string, messages []redis.XMessage) {
+func (c *redisBusConnection) handleQueueStreams(name, key, group string, messages []redis.XMessage, handler func([]byte) error, retryable bool, retries []time.Duration) {
 	for _, msg := range messages {
 		raw, ok := msg.Values["d"]
 		if !ok {
@@ -619,13 +630,47 @@ func (c *redisBusConnection) handleQueueStreams(name, key, group string, message
 			continue
 		}
 
+		attempt := readStreamAttempt(msg.Values["a"])
+		if attempt <= 0 {
+			attempt = 1
+		}
+		after := readStreamAfter(msg.Values["t"])
+		if after > 0 {
+			now := time.Now()
+			if target := time.Unix(after, 0); target.After(now) {
+				time.Sleep(target.Sub(now))
+			}
+		}
+
 		started := time.Now()
-		asyncErr := c.handleAsync(data)
+		var asyncErr error
+		if retryable {
+			asyncErr = c.handleServiceAsync(data, attempt, bus.DispatchFinal(retries, attempt))
+		} else {
+			asyncErr = handler(data)
+		}
 		c.recordStats(name, time.Since(started), asyncErr)
+
 		if asyncErr == nil {
 			_ = c.client.XAck(context.Background(), key, group, msg.ID).Err()
 			_ = c.client.XDel(context.Background(), key, msg.ID).Err()
+			continue
 		}
+
+		if retryable && bus.IsRetryableDispatchError(asyncErr) {
+			if delay, ok := bus.DispatchRetryDelay(retries, attempt); ok {
+				if err := c.enqueueQueue(key, data, attempt+1, delay); err == nil {
+					_ = c.client.XAck(context.Background(), key, group, msg.ID).Err()
+					_ = c.client.XDel(context.Background(), key, msg.ID).Err()
+					continue
+				}
+				// keep pending for reclaim if requeue failed.
+				continue
+			}
+		}
+
+		_ = c.client.XAck(context.Background(), key, group, msg.ID).Err()
+		_ = c.client.XDel(context.Background(), key, msg.ID).Err()
 	}
 }
 
@@ -681,7 +726,7 @@ func (c *redisBusConnection) resolveQueueConsumer() string {
 	return c.queueConsumer
 }
 
-func (c *redisBusConnection) consumeEvent(name string, ps *redis.PubSub) {
+func (c *redisBusConnection) consumeEvent(name string, ps *redis.PubSub, handler func([]byte) error) {
 	defer c.wg.Done()
 	ch := ps.Channel()
 	for {
@@ -691,7 +736,7 @@ func (c *redisBusConnection) consumeEvent(name string, ps *redis.PubSub) {
 				return
 			}
 			started := time.Now()
-			asyncErr := c.handleAsync([]byte(msg.Payload))
+			asyncErr := handler([]byte(msg.Payload))
 			c.recordStats(name, time.Since(started), asyncErr)
 		case <-c.done:
 			return
@@ -842,8 +887,8 @@ func (c *redisBusConnection) currentServices() []string {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 
-	names := make([]string, 0, len(c.subjects))
-	for name := range c.subjects {
+	names := make([]string, 0, len(c.services))
+	for name := range c.services {
 		names = append(names, c.serviceName(name))
 	}
 	sort.Strings(names)
@@ -913,11 +958,18 @@ func (c *redisBusConnection) handleCall(data []byte) ([]byte, error) {
 	return c.instance.HandleCall(data)
 }
 
-func (c *redisBusConnection) handleAsync(data []byte) error {
+func (c *redisBusConnection) handleServiceAsync(data []byte, attempt int, final bool) error {
 	if c.instance == nil {
 		c.instance = &bus.Instance{}
 	}
-	return c.instance.HandleAsync(data)
+	return c.instance.HandleServiceAsync(data, attempt, final)
+}
+
+func (c *redisBusConnection) handleMessage(data []byte) error {
+	if c.instance == nil {
+		c.instance = &bus.Instance{}
+	}
+	return c.instance.HandleMessage(data)
 }
 
 func (c *redisBusConnection) recordStats(subject string, cost time.Duration, err error) {
@@ -936,6 +988,70 @@ func (c *redisBusConnection) recordStats(subject string, cost time.Duration, err
 	}
 }
 
+func (c *redisBusConnection) enqueueQueue(subject string, data []byte, attempt int, delay time.Duration) error {
+	if attempt <= 0 {
+		attempt = 1
+	}
+	after := int64(0)
+	if delay > 0 {
+		after = time.Now().Add(delay).Unix()
+	}
+	return c.client.XAdd(context.Background(), &redis.XAddArgs{
+		Stream: subject,
+		Values: map[string]any{
+			"d": data,
+			"a": attempt,
+			"t": after,
+		},
+	}).Err()
+}
+
+func readStreamAttempt(raw any) int {
+	switch vv := raw.(type) {
+	case int:
+		if vv > 0 {
+			return vv
+		}
+	case int64:
+		if vv > 0 {
+			return int(vv)
+		}
+	case float64:
+		if vv > 0 {
+			return int(vv)
+		}
+	case string:
+		if n, err := strconv.Atoi(strings.TrimSpace(vv)); err == nil && n > 0 {
+			return n
+		}
+	case []byte:
+		if n, err := strconv.Atoi(strings.TrimSpace(string(vv))); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 1
+}
+
+func readStreamAfter(raw any) int64 {
+	switch vv := raw.(type) {
+	case int:
+		return int64(vv)
+	case int64:
+		return vv
+	case float64:
+		return int64(vv)
+	case string:
+		if n, err := strconv.ParseInt(strings.TrimSpace(vv), 10, 64); err == nil {
+			return n
+		}
+	case []byte:
+		if n, err := strconv.ParseInt(strings.TrimSpace(string(vv)), 10, 64); err == nil {
+			return n
+		}
+	}
+	return 0
+}
+
 func parseDurationSetting(v any) time.Duration {
 	switch vv := v.(type) {
 	case time.Duration:
@@ -949,6 +1065,9 @@ func parseDurationSetting(v any) time.Duration {
 	case string:
 		if d, err := time.ParseDuration(vv); err == nil {
 			return d
+		}
+		if n, err := strconv.Atoi(strings.TrimSpace(vv)); err == nil {
+			return time.Second * time.Duration(n)
 		}
 	}
 	return 0
